@@ -1,0 +1,78 @@
+#!/usr/bin/env python
+
+# Copyright 2014 William H. St. Clair
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import threading, boto, boto.ec2, Queue
+from datetime import datetime
+
+def main():
+    argument_spec = ec2_argument_spec()
+    argument_spec.update(
+        dict(
+            instance_id = dict(),
+            volume_group = dict()
+        )
+    )
+
+    module = AnsibleModule(argument_spec=argument_spec)
+
+    instance_id = module.params.get('instance_id')
+    volume_group = module.params.get('volume_group')
+
+    ec2 = ec2_connect(module)
+    vols = ec2.get_all_volumes(filters={
+        'attachment.instance-id': instance_id,
+        'tag:volume_group': volume_group})
+
+    threads = []
+    snapshots = []
+
+    now = datetime.utcnow().strftime("%FT%TZ")
+
+    try:
+        for volume in vols:
+            def take_snapshot():
+                local = threading.local()
+                local.vol = volume
+
+                snapshot = local.vol.create_snapshot('{} {} {}'.format(
+                    local.vol.tags['volume_group'],
+                    local.vol.attach_data.device,
+                    now))
+
+                for k, v in local.vol.tags.iteritems():
+                    snapshot.add_tag(k, v)
+
+                snapshot.add_tag('timestamp', now)
+                snapshots.append(snapshot)
+
+
+            t = threading.Thread(target=take_snapshot)
+            threads.append(t)
+            t.start()
+
+    except boto.exception.BotoServerError, e:
+        module.fail_json(msg = "%s: %s" % (e.error_code, e.error_message))
+
+    for t in threads:
+        t.join()
+
+    module.exit_json(changed=True, snapshot_ids=[s.id for s in snapshots], timestamp=now)
+
+
+from ansible.module_utils.basic import *
+from ansible.module_utils.ec2 import *
+
+main()
